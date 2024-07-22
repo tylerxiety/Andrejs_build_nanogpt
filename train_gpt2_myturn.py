@@ -2,7 +2,8 @@ from dataclasses import dataclass
 import torch.nn as nn
 import math
 import torch
-
+from torch.nn import functional as F
+import time
 
 # TDODO
 # watch/read attention code in previous video again
@@ -24,6 +25,9 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        # **Added by chatgpt: Autoregressive mask to prevent attention to future positions**
+        self.register_buffer("bias", torch.tril(torch.ones((config.block_size, config.block_size), dtype=torch.uint8)).view(1, 1, config.block_size, config.block_size))
+
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -40,14 +44,14 @@ class CausalSelfAttention(nn.Module):
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
        
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))  # autoregressive mask
-        att = F.softmax(att, dim=1) # normalize
+        att = F.softmax(att, dim=-1) # normalize
 
         y = att @ v # weighted sum:(B, nh, T, T) X (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side. perform the concatenat ion function.
         # output projection
         y = self.c_proj(y)
         return y
-    
+
 
 class MLP(nn.Module):
     # nn.GELU(approximate='tanh') is an approximate version of GELU that was developed due to
@@ -86,16 +90,15 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
-    # OG transformer: LN is after attn or FF, and 
-    # LN is inside the residual stream
+    # OG transformer: LN is after attn or FF, and LN is inside the residual stream
     # GPT2: clean residual stream from supervision all the way down to the inputs, 
-    # which is desirable, because the gradients from top flow straigt to the inputs unchanged.
+    # which is desirable, because the gradients from top flow straight to the inputs unchanged.
     # The attn is an aggregation func, weighted sum, like reduce
     # whereas mlp happens at every single token individually, like map,
     # so the transformer is like a repeteated application of map reduce.
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.mlp(self.ln_2(x)) # aka FFN
         return x
     
 @dataclass
@@ -118,10 +121,10 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        # module transformer, the same to the transformer container in huggingface.
-        # nn.ModuleDict: so that we can index submodule using keys.
+        # create module transformer, the same to the transformer container in huggingface,
+        # using nn.ModuleDict: so that we can index submodule using keys.
         # nn.Embedding is just a fancy wraper around tensor.
-        # nn.ModuleList: so that we can index it using integers, same to the schema in huggingface.
+        # nn.ModuleList: so that we can index it using integers, same to the schema in huggingface. 12 layers (h.0 - h.11) in the huggingface transformer.
         # ln_f: GPT2 has a final LN at the end, which is different to the OG transformer paper.
         # The other main difference is that LN is moved to before the MLP in GPT2.
         # lm_head: GPT2 uses no bias in the final projection.
@@ -132,12 +135,12 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
+    
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
-        # forward the token and posisition embeddings
+        # forward the token and position embeddings
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
@@ -152,7 +155,6 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
-    
     
     @classmethod
     def from_pretrained(cls, model_type):
@@ -204,5 +206,93 @@ class GPT(nn.Module):
         return model
 
 # -----------------------------------------------------------------------------
-model= GPT.from_pretrained('gpt2')
-print("didn't crash yay!")
+
+# attempt to autodetetct the device
+# mps: 3.7750349044799805
+# cpu: 14.2483069896698
+device = 'cpu'
+# if torch.cuda.is_available():
+#     device = 'cuda'
+# # for apple silicon
+# elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+#     device = 'mps'
+print(f'using device: {device}')
+
+# train
+# get a data batch
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
+# get logits
+model = GPT(GPTConfig())
+model.to(device)
+logits, loss = model(x, y)
+
+# will get loss: 10.9403
+# sanity check: the init loss should be around -ln(1/50257) = 10.8, 
+# as uniform probability at initialization.
+print(loss) 
+import sys; sys.exit(0)
+
+# # prefix tokens
+# num_return_sequences = 5
+# max_length = 30
+
+# model= GPT.from_pretrained('gpt2')
+# model.eval()
+# model.to(device)
+
+# import tiktoken
+# enc = tiktoken.get_encoding('gpt2')
+# tokens = enc.encode("Hello, I'm a language model,")
+# tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+# tokens = tokens.unsqueeze(0).repeat(5, 1) # (5, 8)
+# x = tokens.to(device)
+
+# # generate!
+# torch.manual_seed(42)
+# torch.mps.manual_seed(42)
+# # torch.cuda.manual_seed(42)
+# t_s = time.time()
+# while x.size(1) < max_length: # max_length=30
+#     # forward the model to get the logits
+#     with torch.no_grad():
+#         logits = model(x) # (B, T, vocab_size)
+#         # take the logits at the last position
+#         logits = logits[:, -1, :] # (B, vocab_size)
+#         # get the probabilities
+#         probs = F.softmax(logits, dim=-1)
+#         # do top-k sampling of 50 (huggingface pipeline default)
+#         # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+#         # select a token from the top-k probabilities
+#         # note: multinomial does not demand the input to sum to 1
+#         ix = torch.multinomial(topk_probs, 1) # (B, 1)
+#         # gather the corresponding indices
+#         xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+#         # append to the sequence
+#         x = torch.cat((x, xcol), dim=1)
+
+# t_e = time.time()
+# t_dff = t_e - t_s
+
+# print(f'time: {t_dff}')
+# for i in range(num_return_sequences):
+#     tokens = x[i, :max_length].tolist()
+#     decoded = enc.decode(tokens)
+#     print(">", decoded)
+
+
+
+
+# check loading huggingface GPT2 param
+# model= GPT.from_pretrained('gpt2')
+# print("didn't crash yay!")
