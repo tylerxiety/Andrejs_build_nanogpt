@@ -73,7 +73,10 @@ class MLP(nn.Module):
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu    = nn.GELU(approximate='tanh')
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
-        # self.c_proj.NANOGPT_SCALE_INIT = 1
+        # at init, scale the weights of residual layers by a factor of 1/sqrt(num of residual layers).
+        # because the variance of the activations in the residual stream grows, by sqrt(num of residual layers) if random
+        # set a flag here.
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -86,6 +89,7 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        # in layernorm, use the default init in pytorch, scale to be 1 and offset to be 0
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
@@ -135,7 +139,33 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-    
+        
+        # weight sharing scheme
+        # why tie the token embedding at the bottom of transformer and lm head at the top of the transformer togather:
+        # you want these 2 matrices behave similar in the following sense. Similar tokens should be nearly in the token embedding space, similarly, they also should have the same/similar probablity at the output of a transformer.
+        # Another reason is, this saves 30% parameters, so it's more efficient in terms of training.
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        # call .apply() to iterate the submodule and apply _init_weights()
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # use 0.02, the same to the GPT2 code
+            # typically, if following the xavier init, std = 1/sqrt(768 model dimensions) = 0.036. So 0.02 is roughly in the same vicinity.
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                # 2 times here, because every layer has 2 blocks that add to the residual pathway: attn and mlp.
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                # in pytorch the default init is uniform
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
@@ -205,41 +235,119 @@ class GPT(nn.Module):
 
         return model
 
+
+
+# -----------------------------------------------------------------------------
+import tiktoken
+# import numpy as np
+
+# def load_tokens(filename):
+#     npt = np.load(filename)
+#     npt = npt.astype(np.int32) # added after video
+#     ptt = torch.tensor(npt, dtype=torch.long)
+#     return ptt
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # at init load tokens from disk and stoe them in memory
+        # default on CPU
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"load {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        # state
+        self.current_position = 0
+
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B * T 
+        # if loading the next batch would be out of bounds, rest
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+
 # -----------------------------------------------------------------------------
 
 # attempt to autodetetct the device
-# mps: 3.7750349044799805
-# cpu: 14.2483069896698
 device = 'cpu'
-# if torch.cuda.is_available():
-#     device = 'cuda'
-# # for apple silicon
-# elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-#     device = 'mps'
+if torch.cuda.is_available():
+    device = 'cuda'
+# for apple silicon
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = 'mps'
 print(f'using device: {device}')
 
+ 
+# for reproducibility
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+
 # train
-# get a data batch
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
+# track time
+t_s = time.time()
+
+train_loader = DataLoaderLite(B=4, T=32)
+
+# enc = tiktoken.get_encoding('gpt2')
+# with open('input.txt', 'r') as f:
+#     text = f.read()
+# text = text[:1000]
+# tokens = enc.encode(text)
+# B, T = 4, 32
+# buf = torch.tensor(tokens[:B*T + 1]) # +1 to include the label for the last token.
+# buf = buf.to(device) # can't directly do .to() like model, because it's a tensor and not stateful.
+# x = buf[:-1].view(B, T)
+# y = buf[1:].view(B, T)
 
 # get logits
 model = GPT(GPTConfig())
 model.to(device)
-logits, loss = model(x, y)
+
+
+# optimize!
+# AdamW is a bug-fixed version of Adam. 
+# keeps 2 buffers: m, v momentum, like RMSprop.
+# faster than SGD
+# overfit a single batch: 5 rounds: mps: 1.435 loss, 7.20 seconds. cpu: 1.470 loss, 17.1533 seconds; 50 rounds : mps: 0.0028 loss, 23.20 seconds. cpu: 0.0028 loss, 148.49 seconds
+# iterate batches: 50 rounds : mps: 6.5409 loss, 23.644 seconds. cpu: 6.5205 loss, 152.89seconds.
+# at this scale, most of the loss gain comes from deleting the usage of tokens that never occur (by driving the biases of all the logits that never occur to -inf.)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device) # move tensors to GPU/MPS
+    optimizer.zero_grad() # always to zero the grads first
+    logits, loss = model(x, y)
+    loss.backward() # deposit grads(i.e., do += on grads), accumulates the grads from this loss
+    optimizer.step() # to update the param
+    print(f"step {i}, loss: {loss.item()}")
+
 
 # will get loss: 10.9403
 # sanity check: the init loss should be around -ln(1/50257) = 10.8, 
 # as uniform probability at initialization.
-print(loss) 
+# cpu: 2.1077, mps: 5.656, interesting
+# logits, loss = model(x, y)
+# print(loss) 
+
+t_e = time.time()
+t_dff = t_e - t_s
+
+print(f'time: {t_dff}')
 import sys; sys.exit(0)
 
 # # prefix tokens
