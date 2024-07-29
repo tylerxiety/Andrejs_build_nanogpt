@@ -3,7 +3,7 @@ import torch.nn as nn
 import math
 import torch
 from torch.nn import functional as F
-import time
+
 
 # TDODO
 # watch/read attention code in previous video again
@@ -280,7 +280,7 @@ class DataLoaderLite:
 
 
 # -----------------------------------------------------------------------------
-
+import time
 # attempt to autodetetct the device
 device = 'cpu'
 if torch.cuda.is_available():
@@ -298,10 +298,18 @@ if torch.cuda.is_available():
 
 
 # train
-# track time
-t_s = time.time()
+# MPS backend out of memory when using (B=16, T=1024) on macbook air
+# mps: step 1, loss: 9.525256156921387, dt: 5741.08ms, tok/sec: 713.45
+# cpu: step 1, loss: 9.525256156921387, dt: 103424.57ms, tok/sec: 39.60
 
-train_loader = DataLoaderLite(B=4, T=32)
+# precision options for training: FP32, TF32, BF16, FP16;
+# INT8 is for inference.
+# recommend read: Automatic Mixed Precision pytorch doc
+# torch.autocast(device_type=device, dtype=torch.bfloat16), mps not supported
+# using bfloat16 (in stead of float16) is minimual in code change since no need for gradient scaler
+# under the hood, some matrix multuply like operations are converted to BF16, but a lot of operations remain in float32(e.g, layernorm, softmax, etc)
+train_loader = DataLoaderLite(B=4, T=1024) # GPT2 max seq length
+torch.set_float32_matmul_precision('high') # TF32 available on macbook air with M1 according to doc, but the tok/sec is almost unchanged.
 
 # enc = tiktoken.get_encoding('gpt2')
 # with open('input.txt', 'r') as f:
@@ -328,13 +336,20 @@ model.to(device)
 # at this scale, most of the loss gain comes from deleting the usage of tokens that never occur (by driving the biases of all the logits that never occur to -inf.)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device) # move tensors to GPU/MPS
+    print(x.device.type)
     optimizer.zero_grad() # always to zero the grads first
     logits, loss = model(x, y)
+    # import code; code.interact(local=locals()) # interactively check
     loss.backward() # deposit grads(i.e., do += on grads), accumulates the grads from this loss
     optimizer.step() # to update the param
-    print(f"step {i}, loss: {loss.item()}")
+    torch.mps.synchronize() # waiting for the device to finish
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # in miliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 
 # will get loss: 10.9403
@@ -344,10 +359,6 @@ for i in range(50):
 # logits, loss = model(x, y)
 # print(loss) 
 
-t_e = time.time()
-t_dff = t_e - t_s
-
-print(f'time: {t_dff}')
 import sys; sys.exit(0)
 
 # # prefix tokens
