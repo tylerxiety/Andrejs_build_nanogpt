@@ -39,18 +39,21 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
-        # attension ( materializes the large (T, T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-       
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))  # autoregressive mask
-        att = F.softmax(att, dim=-1) # normalize
-
-        y = att @ v # weighted sum:(B, nh, T, T) X (B, nh, T, hs) -> (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention, equivalent to the following 4 lines of code but much faster. Not supported on MPS.
+        # # attension ( materializes the large (T, T) matrix for all the queries and keys)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))  # autoregressive mask
+        # att = F.softmax(att, dim=-1) # normalize
+        # y = att @ v # weighted sum:(B, nh, T, T) X (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side. perform the concatenat ion function.
         # output projection
         y = self.c_proj(y)
         return y
+
+# # not using it, for demo purpose only
+# class TanhGELU(nn.Module):
+#     def forward(self, input):
+#         return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
 
 
 class MLP(nn.Module):
@@ -301,13 +304,17 @@ if torch.cuda.is_available():
 # MPS backend out of memory when using (B=16, T=1024) on macbook air
 # mps: step 1, loss: 9.525256156921387, dt: 5741.08ms, tok/sec: 713.45
 # cpu: step 1, loss: 9.525256156921387, dt: 103424.57ms, tok/sec: 39.60
+# use "nice" number: round up the vocab_size 50257 to nearest "nice" number that has a lot of power of 2, eg 50304. Got 4% speedup in the video. But got worse on MPS, may due to the memory.
 
-# precision options for training: FP32, TF32, BF16, FP16;
-# INT8 is for inference.
+# The following speedup techniques are not supported on the MPS:
+# 1. lower precisions: precision options for training: FP32, TF32, BF16, FP16; INT8 is for inference.
 # recommend read: Automatic Mixed Precision pytorch doc
 # torch.autocast(device_type=device, dtype=torch.bfloat16), mps not supported
 # using bfloat16 (in stead of float16) is minimual in code change since no need for gradient scaler
 # under the hood, some matrix multuply like operations are converted to BF16, but a lot of operations remain in float32(e.g, layernorm, softmax, etc)
+# 2. use torch.compile(model)
+# 3. flash attention
+
 train_loader = DataLoaderLite(B=4, T=1024) # GPT2 max seq length
 torch.set_float32_matmul_precision('high') # TF32 available on macbook air with M1 according to doc, but the tok/sec is almost unchanged.
 
@@ -323,9 +330,10 @@ torch.set_float32_matmul_precision('high') # TF32 available on macbook air with 
 # y = buf[1:].view(B, T)
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304)) # rounded up the vocab_size 50257 to nearest "nice" number that has a lot of power of 2. Got 4% speedup in the video.
 model.to(device)
-
+# model = torch.compile(model) # mps not supported for complie. 3X faster in the video.
+# The speedup comes from: 1. reduce python overhead.The python interpreter run layer by layer (i.e., ego mode). The torch.compile compiles the entire neural net as a single object without python interpreter involved, and runs the code efficiently. 2. optimize the read/write between GPU and HBM/global memory (reducing the number of intermediate memory writes and reads).
 
 # optimize!
 # AdamW is a bug-fixed version of Adam. 
@@ -339,7 +347,6 @@ for i in range(50):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device) # move tensors to GPU/MPS
-    print(x.device.type)
     optimizer.zero_grad() # always to zero the grads first
     logits, loss = model(x, y)
     # import code; code.interact(local=locals()) # interactively check
