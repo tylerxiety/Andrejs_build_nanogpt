@@ -330,7 +330,8 @@ torch.set_float32_matmul_precision('high') # TF32 available on macbook air with 
 # y = buf[1:].view(B, T)
 
 # get logits
-model = GPT(GPTConfig(vocab_size=50304)) # rounded up the vocab_size 50257 to nearest "nice" number that has a lot of power of 2. Got 4% speedup in the video.
+# model = GPT(GPTConfig(vocab_size=50304)) # rounded up the vocab_size 50257 to nearest "nice" number that has a lot of power of 2. Got 4% speedup in the video.
+model = GPT(GPTConfig()) 
 model.to(device)
 # model = torch.compile(model) # mps not supported for complie. 3X faster in the video.
 # The speedup comes from: 1. reduce python overhead.The python interpreter run layer by layer (i.e., ego mode). The torch.compile compiles the entire neural net as a single object without python interpreter involved, and runs the code efficiently. 2. optimize the read/write between GPU and HBM/global memory (reducing the number of intermediate memory writes and reads).
