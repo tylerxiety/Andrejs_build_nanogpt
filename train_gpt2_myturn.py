@@ -3,7 +3,7 @@ import torch.nn as nn
 import math
 import torch
 from torch.nn import functional as F
-
+import inspect
 
 # TDODO
 # watch/read attention code in previous video again
@@ -238,6 +238,30 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # Start with all of the candidiate parameters that require gradients
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # Create optim group. Any params that is 2D will be decayed, otherwise no decay.
+        # i.e. all weight tensors in matmuls + embeddings decay, all bias, layernorm params, scales don't decay.
+        # Use weight decay as a regularization.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': nodecay_params, 'weight_decay': 0.0},
+            {'params': decay_params, 'weight_decay': weight_decay}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed param tensors: {len(decay_params)}, with {num_decay_params:,} params")
+        print(f"num non-decayed param tensors: {len(nodecay_params)}, with {num_nodecay_params:,} params")
+        # Create AdamW optimizer and use the fused version if available.
+        # Fused version is a lot faster, but not available on all platforms.
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
+        return optimizer
 
 
 # -----------------------------------------------------------------------------
@@ -251,6 +275,7 @@ import tiktoken
 #     return ptt
 
 class DataLoaderLite:
+    # sample data without replacement within the epoch.
     def __init__(self, B, T):
         self.B = B
         self.T = T
@@ -314,7 +339,7 @@ if torch.cuda.is_available():
 # under the hood, some matrix multuply like operations are converted to BF16, but a lot of operations remain in float32(e.g, layernorm, softmax, etc)
 # 2. use torch.compile(model)
 # 3. flash attention
-
+# 4. fused AdamW optimizer
 train_loader = DataLoaderLite(B=4, T=1024) # GPT2 max seq length
 torch.set_float32_matmul_precision('high') # TF32 available on macbook air with M1 according to doc, but the tok/sec is almost unchanged.
 
@@ -336,6 +361,29 @@ model.to(device)
 # model = torch.compile(model) # mps not supported for complie. 3X faster in the video.
 # The speedup comes from: 1. reduce python overhead.The python interpreter run layer by layer (i.e., ego mode). The torch.compile compiles the entire neural net as a single object without python interpreter involved, and runs the code efficiently. 2. optimize the read/write between GPU and HBM/global memory (reducing the number of intermediate memory writes and reads).
 
+# Learning rate schedule: cosine decay with linear warmup, as in the GPT3 paper.
+max_lr = 6e-4 # use the lr for GPT3 small
+min_lr = max_lr * 0.1
+# copilot wrote this, where does this come from: warmup_tokens = 375e6 # 375 million tokens for GPT-2, "0.5" in the video is a typo.
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # not exactly the same as the GPT3 paper, but close enough 
+    # 1) linear warmup for warmup_steps steps
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps # +1 to avoid 0 learning rate
+    # 2) if it > max_steps, return min_lr
+    if it >= max_steps:
+        return min_lr
+    # 3) in between, do cosine decay
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+
+
+
 # optimize!
 # AdamW is a bug-fixed version of Adam. 
 # keeps 2 buffers: m, v momentum, like RMSprop.
@@ -343,8 +391,18 @@ model.to(device)
 # overfit a single batch: 5 rounds: mps: 1.435 loss, 7.20 seconds. cpu: 1.470 loss, 17.1533 seconds; 50 rounds : mps: 0.0028 loss, 23.20 seconds. cpu: 0.0028 loss, 148.49 seconds
 # iterate batches: 50 rounds : mps: 6.5409 loss, 23.644 seconds. cpu: 6.5205 loss, 152.89seconds.
 # at this scale, most of the loss gain comes from deleting the usage of tokens that never occur (by driving the biases of all the logits that never occur to -inf.)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+# Use GPT3 hyper params, due to no details from the GPT2 paper.
+# GPT3 and GPT2 are very similar in terms of the architecture, 
+# expect the doubled context length, some hyper params change, and was trained a lot longer on a bigger dataset.
+# Learning rate: cosine decay with linear warmup.
+# Batch size schedule: skipped. Becasue it complicates the arithmetic, not a major improvement, 
+# more of a systems and speed improvemnet not a algorithmic optimization improvement.
+# Use weight decay of 0.1, as in the GPT3 paper.
+# Note that the relationship among the hyper params, weight decay, learning rate, batch size,Adam params beta1, beta2, epsilon, etc. is very complicated.
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+
+for step in range(50):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device) # move tensors to GPU/MPS
@@ -352,12 +410,23 @@ for i in range(50):
     logits, loss = model(x, y)
     # import code; code.interact(local=locals()) # interactively check
     loss.backward() # deposit grads(i.e., do += on grads), accumulates the grads from this loss
+    # Clip the grads to prevent exploding grads. 
+    # Global norm of all the grads: square root of the sum of the squares of the grads.
+    # Why clip the grads: sometimes the grads can be very large unluckily, and the optimizer can't handle it. It's just a hacky solution.
+    # Norm can be high in the beginning then decreases and stabilizes at the value around 1,
+    # because the model is random and mostly leaning the biases of the output tokens.
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) 
+
+    # determine and set the learning rate
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step() # to update the param
     torch.mps.synchronize() # waiting for the device to finish
     t1 = time.time()
     dt = (t1 - t0) * 1000 # in miliseconds
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 
 # will get loss: 10.9403
