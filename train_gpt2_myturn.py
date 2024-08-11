@@ -121,7 +121,8 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
-
+    # so d_head = n_embd / n_head = 768 / 12 = 64
+    # using GPT3 Small params
 
 class GPT(nn.Module):
 
@@ -340,7 +341,19 @@ if torch.cuda.is_available():
 # 2. use torch.compile(model)
 # 3. flash attention
 # 4. fused AdamW optimizer
-train_loader = DataLoaderLite(B=4, T=1024) # GPT2 max seq length
+
+# gradient accumulation
+total_batch_size = 524288 # 2**19, nice number, ~0.5 million tokens
+# B = 16 # micro batch size
+B = 4 # micro batch size on the MPS
+T = 1024 # sequence length
+assert total_batch_size % (B * T) == 0, "make sure the total batch size is divisible by B * T"
+grad_acc_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size} ")
+print(f"gradient accumulation steps: {grad_acc_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T) # GPT2 max seq length
+
 torch.set_float32_matmul_precision('high') # TF32 available on macbook air with M1 according to doc, but the tok/sec is almost unchanged.
 
 # enc = tiktoken.get_encoding('gpt2')
@@ -399,22 +412,30 @@ def get_lr(it):
 # more of a systems and speed improvemnet not a algorithmic optimization improvement.
 # Use weight decay of 0.1, as in the GPT3 paper.
 # Note that the relationship among the hyper params, weight decay, learning rate, batch size,Adam params beta1, beta2, epsilon, etc. is very complicated.
+# Gradient accumulation: we want to use the batch size of 0.5 million as per the GPT3 paper, but the GPU won't fit. So we use a smaller batch size and accumulate the gradients over multiple steps.
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 
 for step in range(50):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device) # move tensors to GPU/MPS
     optimizer.zero_grad() # always to zero the grads first
-    logits, loss = model(x, y)
-    # import code; code.interact(local=locals()) # interactively check
-    loss.backward() # deposit grads(i.e., do += on grads), accumulates the grads from this loss
-    # Clip the grads to prevent exploding grads. 
-    # Global norm of all the grads: square root of the sum of the squares of the grads.
-    # Why clip the grads: sometimes the grads can be very large unluckily, and the optimizer can't handle it. It's just a hacky solution.
-    # Norm can be high in the beginning then decreases and stabilizes at the value around 1,
-    # because the model is random and mostly leaning the biases of the output tokens.
+    loss_accum = 0.0
+    for micro_step in range(grad_acc_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device) # move tensors to GPU/MPS
+        # bfloat16 is not sypprted on MPS
+        # with torch.autocast(device_type=device, dtype=torch.bfloat16)
+        #     logits, loss = model(x, y)
+        logits, loss = model(x, y)
+        # import code; code.interact(local=locals()) # interactively check
+        loss = loss / grad_acc_steps # because the loss is averaged over the batch, due to the reduction='mean' in the cross_entropy function.
+        loss_accum += loss.detach() # use detach to avoid the grad computation.
+        loss.backward() # deposit grads(i.e., do += on grads), accumulates the grads from this loss
+        # Clip the grads to prevent exploding grads. 
+        # Global norm of all the grads: square root of the sum of the squares of the grads.
+        # Why clip the grads: sometimes the grads can be very large unluckily, and the optimizer can't handle it. It's just a hacky solution.
+        # Norm can be high in the beginning then decreases and stabilizes at the value around 1,
+        # because the model is random and mostly leaning the biases of the output tokens.
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) 
 
     # determine and set the learning rate
@@ -425,8 +446,8 @@ for step in range(50):
     torch.mps.synchronize() # waiting for the device to finish
     t1 = time.time()
     dt = (t1 - t0) * 1000 # in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_acc_steps) / dt
+    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 
 # will get loss: 10.9403
