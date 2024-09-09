@@ -26,7 +26,8 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         # **Added by chatgpt: Autoregressive mask to prevent attention to future positions**
-        self.register_buffer("bias", torch.tril(torch.ones((config.block_size, config.block_size), dtype=torch.uint8)).view(1, 1, config.block_size, config.block_size))
+        # no need this line when using scaled_dot_product_attention(is_causal=True) below
+        # self.register_buffer("bias", torch.tril(torch.ones((config.block_size, config.block_size), dtype=torch.uint8)).view(1, 1, config.block_size, config.block_size))
 
 
     def forward(self, x):
@@ -140,9 +141,9 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
+            ln_f = nn.LayerNorm(config.n_embd),  #GPT2 has a final LN at the end, which is different to the OG transformer pape
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # GPT2 uses no bias in the final projection
         
         # weight sharing scheme
         # why tie the token embedding at the bottom of transformer and lm head at the top of the transformer togather:
@@ -367,7 +368,7 @@ torch.set_float32_matmul_precision('high') # TF32 available on macbook air with 
 # x = buf[:-1].view(B, T)
 # y = buf[1:].view(B, T)
 
-# get logits
+# create model
 # model = GPT(GPTConfig(vocab_size=50304)) # rounded up the vocab_size 50257 to nearest "nice" number that has a lot of power of 2. Got 4% speedup in the video.
 model = GPT(GPTConfig()) 
 model.to(device)
@@ -446,7 +447,7 @@ for step in range(50):
     torch.mps.synchronize() # waiting for the device to finish
     t1 = time.time()
     dt = (t1 - t0) * 1000 # in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T * grad_acc_steps) / dt
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_acc_steps) / (dt / 1000)
     print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 
@@ -459,6 +460,7 @@ for step in range(50):
 
 import sys; sys.exit(0)
 
+# # test by loading GPT2 model from huggingface
 # # prefix tokens
 # num_return_sequences = 5
 # max_length = 30
